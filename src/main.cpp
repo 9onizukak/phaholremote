@@ -1,7 +1,8 @@
 #include "session.h"
 #include "ip_badge.h"
 #include "resource.h"
-#include "version.h"
+#include "update.h"
+#include "ui_theme.h"
 
 #include <shellapi.h>
 #include <ole2.h>
@@ -17,21 +18,27 @@ constexpr char kViewerClass[] = "PhaholRemoteViewer";
 constexpr char kAppTitle[] = "Phahol Remote v" PHAHOL_REMOTE_VERSION;
 constexpr char kViewerTitle[] = "Phahol Remote v" PHAHOL_REMOTE_VERSION " - Viewer";
 constexpr int kConnectButton = 104;
+constexpr int kUpdateButton = 106;
+constexpr int kLocalIpLabel = 107;
+constexpr COLORREF kLocalIpBackground = RGB(31, 62, 87);
 constexpr UINT kSecureAttention = 201;
 constexpr UINT kShutdownHost = 202;
 constexpr UINT kRestartHost = 203;
 constexpr UINT kPasteFiles = 204;
 constexpr UINT kChooseFiles = 205;
-constexpr LONG kTransferBarHeight = 36;
-constexpr int kTransferButtonWidth = 108;
-constexpr int kTransferBarPadding = 6;
+constexpr int kMainWidth = 728;
+constexpr int kMainHeight = 452;
+constexpr int kTransferBarHeight = 56;
+constexpr int kTransferButtonWidth = 112;
+constexpr int kTransferBarPadding = 12;
 constexpr int kTransferStatusLeft = 2 * kTransferButtonWidth + 3 * kTransferBarPadding;
-constexpr char kTransferIdle[] = "No files queued. Drag files here, paste from Explorer, or select Send files.";
+constexpr char kTransferIdle[] = "Drag files here or paste files copied from Explorer.";
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kTrayIconId = 1;
 constexpr UINT kTrayOpen = 1;
 constexpr UINT kTrayExit = 2;
 constexpr UINT kTrayToggleIpBadge = 3;
+constexpr UINT kTrayCheckUpdates = 4;
 
 struct App {
     HINSTANCE instance = nullptr;
@@ -41,7 +48,9 @@ struct App {
     HWND connectButton = nullptr;
     HWND address = nullptr;
     HWND hostText = nullptr;
+    HWND localIpText = nullptr;
     HWND clientText = nullptr;
+    HWND updateText = nullptr;
     HWND ipBadge = nullptr;
     UINT taskbarCreated = 0;
     bool trayAdded = false;
@@ -50,13 +59,29 @@ struct App {
 
     std::atomic_bool hostStop{false};
     std::atomic_bool hostRunning{false};
+    std::mutex hostSessionGate;
     Status hostStatus;
     std::thread hostThread;
     std::unique_ptr<ViewerSession> session;
     std::atomic_bool clientRunning{false};
     std::thread clientThread;
 
+    std::atomic_bool updateStop{false};
+    std::future<UpdateResult> updateTask;
+    Clock::time_point nextUpdateCheck{};
+    Clock::time_point nextInstallAttempt{};
+    UpdateResult pendingUpdate;
+    UpdateProcess updateProcess{nullptr, CloseHandle};
+    std::wstring stagedSetup;
+    UINT applyUpdateMessage = 0;
+    uint32_t updateToken = 0;
+    bool deferInstall = false;
+
     std::shared_ptr<const Pixels> displayed;
+    std::string hostTextValue;
+    std::string clientTextValue;
+    std::string localIpValue;
+    bool disconnectLabel = false;
     std::string viewerTitle;
     std::string viewerTransferText;
     unsigned mouseButtons = 0;
@@ -64,6 +89,7 @@ struct App {
     bool oleDropRegistered = false;
 
     void RequestStop() {
+        updateStop.store(true);
         hostStop.store(true);
         if (session) session->stop.store(true);
     }
@@ -72,10 +98,75 @@ struct App {
         RequestStop();
         if (hostThread.joinable()) hostThread.join();
         if (clientThread.joinable()) clientThread.join();
+        if (updateTask.valid()) updateTask.wait();
     }
 };
 
 App app;
+
+void CheckForUpdates(bool manual) {
+    if (app.closing) return;
+    if (manual) {
+        app.nextInstallAttempt = {};
+        if (app.updateTask.valid() || app.updateProcess || !app.pendingUpdate.installer.empty()) return;
+    }
+    app.nextUpdateCheck = Clock::now() + std::chrono::hours(24);
+    SetWindowTextA(app.updateText, "Checking GitHub Releases...");
+    app.updateTask = std::async(std::launch::async, [] { return FetchUpdate(app.updateStop); });
+}
+
+void PollUpdate(HWND window) {
+    if (app.updateToken) {
+        if (!app.updateProcess || WaitForSingleObject(app.updateProcess.get(), 0) == WAIT_TIMEOUT) return;
+        app.updateProcess.reset();
+        app.updateToken = 0;
+        DeleteFileW(app.stagedSetup.c_str());
+        app.stagedSetup.clear();
+        if (std::exchange(app.deferInstall, false)) {
+            app.nextInstallAttempt = Clock::now() + 1min;
+            SetWindowTextA(app.updateText, "Update waiting for remote sessions to end.");
+        } else {
+            app.pendingUpdate = {};
+            SetWindowTextA(app.updateText, "Update cancelled or Setup could not complete.");
+        }
+        return;
+    }
+    if (app.updateTask.valid()) {
+        if (app.updateTask.wait_for(0ms) != std::future_status::ready) return;
+        app.pendingUpdate = app.updateTask.get();
+        if (app.pendingUpdate.installer.empty()) {
+            SetWindowTextA(app.updateText, app.pendingUpdate.message.c_str());
+        } else if (!app.applyUpdateMessage || !RunningInstalledCopy()) {
+            app.pendingUpdate = {};
+            SetWindowTextA(app.updateText, "Open the installed copy to apply the update.");
+        } else {
+            SetWindowTextA(app.updateText, "Update ready. Waiting for remote sessions to end.");
+        }
+        return;
+    }
+    if (app.pendingUpdate.installer.empty()) {
+        if (Clock::now() >= app.nextUpdateCheck) CheckForUpdates(false);
+        return;
+    }
+    if (app.clientRunning.load() || Clock::now() < app.nextInstallAttempt) return;
+    {
+        std::unique_lock<std::mutex> host(app.hostSessionGate, std::try_to_lock);
+        if (!host) return;
+    }
+
+    uint32_t token = 0;
+    if (BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(&token), sizeof(token),
+                        BCRYPT_USE_SYSTEM_PREFERRED_RNG) >= 0) {
+        app.updateToken = (token & 0x7fffffffu) | 1u;
+        const auto message = "Starting Setup " + app.pendingUpdate.version + "...";
+        SetWindowTextA(app.updateText, message.c_str());
+        app.updateProcess = LaunchUpdate(app.pendingUpdate.installer, window, app.updateToken, app.stagedSetup);
+        if (app.updateProcess) return;
+    }
+    app.updateToken = 0;
+    app.pendingUpdate = {};
+    SetWindowTextA(app.updateText, "Setup could not start. Check for updates to retry.");
+}
 
 HICON LoadAppIcon(int width, int height) {
     const auto icon = static_cast<HICON>(LoadImageA(app.instance, MAKEINTRESOURCEA(IDI_PHAHOL_REMOTE),
@@ -116,6 +207,7 @@ void ShowTrayMenu(HWND window, POINT position) {
         AppendMenuA(menu, MF_STRING, kTrayToggleIpBadge,
                     IsWindowVisible(app.ipBadge) ? "Hide IPv4 badge" : "Show IPv4 badge");
     }
+    AppendMenuA(menu, MF_STRING, kTrayCheckUpdates, "Check for updates");
     AppendMenuA(menu, MF_STRING, kTrayExit, "Exit");
     SetMenuDefaultItem(menu, kTrayOpen, FALSE);
 
@@ -129,6 +221,7 @@ void ShowTrayMenu(HWND window, POINT position) {
         ShowWindow(app.ipBadge, IsWindowVisible(app.ipBadge) ? SW_HIDE : SW_SHOWNOACTIVATE);
     }
     if (command == kTrayExit) PostMessageA(window, WM_CLOSE, 0, 0);
+    if (command == kTrayCheckUpdates) CheckForUpdates(true);
     if (!command) {
         auto icon = TrayIcon(window);
         Shell_NotifyIconA(NIM_SETFOCUS, &icon);
@@ -138,7 +231,7 @@ void ShowTrayMenu(HWND window, POINT position) {
 RECT VideoArea(HWND window) {
     RECT client{};
     GetClientRect(window, &client);
-    client.top = std::min(client.bottom, kTransferBarHeight);
+    client.top = std::min(client.bottom, static_cast<LONG>(theme::Px(kTransferBarHeight)));
     return client;
 }
 
@@ -187,7 +280,9 @@ void PaintViewer(HWND window) {
     const HDC dc = BeginPaint(window, &paint);
     const auto video = VideoArea(window);
     const RECT bar{video.left, 0, video.right, video.top};
-    FillRect(dc, &bar, GetSysColorBrush(COLOR_BTNFACE));
+    theme::Fill(dc, bar, theme::canvas);
+    const RECT divider{bar.left, bar.bottom - 1, bar.right, bar.bottom};
+    theme::Fill(dc, divider, theme::border);
     RenderViewer(dc, video, VideoRectangle(window), app.displayed.get());
     EndPaint(window, &paint);
 }
@@ -380,17 +475,19 @@ private:
 
 bool CreateTransferBar(HWND window) {
     const auto button = [&](UINT id, const char* text, int left) {
-        return CreateWindowExA(0, "BUTTON", text, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                               left, 5, kTransferButtonWidth, 26, window,
+        return CreateWindowExA(0, "BUTTON", text, WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                               theme::Px(left), theme::Px(10), theme::Px(kTransferButtonWidth),
+                               theme::Px(36), window,
                                reinterpret_cast<HMENU>(static_cast<UINT_PTR>(id)), app.instance, nullptr);
     };
     const auto send = button(kChooseFiles, "Send files...", kTransferBarPadding);
     const auto paste = button(kPasteFiles, "Paste files", kTransferButtonWidth + 2 * kTransferBarPadding);
     app.viewerTransferStatus = CreateWindowExA(0, "STATIC", kTransferIdle,
         WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE | SS_NOPREFIX | SS_ENDELLIPSIS,
-        kTransferStatusLeft, 0, 0, kTransferBarHeight, window, nullptr, app.instance, nullptr);
+        theme::Px(kTransferStatusLeft), 0, 0, theme::Px(kTransferBarHeight), window, nullptr,
+        app.instance, nullptr);
     if (!send || !paste || !app.viewerTransferStatus) return false;
-    const auto font = reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT));
+    const auto font = reinterpret_cast<WPARAM>(theme::Type().body);
     for (const auto control : {send, paste, app.viewerTransferStatus}) SendMessageA(control, WM_SETFONT, font, FALSE);
     return true;
 }
@@ -494,13 +591,24 @@ LRESULT CALLBACK ViewerProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         case WM_PAINT:
             PaintViewer(window);
             return 0;
+        case WM_DRAWITEM:
+            if (theme::Button(*reinterpret_cast<const DRAWITEMSTRUCT*>(lParam), wParam == kChooseFiles,
+                              theme::canvas)) return TRUE;
+            break;
+        case WM_CTLCOLORSTATIC: {
+            const auto dc = reinterpret_cast<HDC>(wParam);
+            SetTextColor(dc, theme::muted);
+            SetBkColor(dc, theme::canvas);
+            SetDCBrushColor(dc, theme::canvas);
+            return reinterpret_cast<LRESULT>(GetStockObject(DC_BRUSH));
+        }
         case WM_ERASEBKGND:
             return 1;
         case WM_SIZE:
             if (app.viewerTransferStatus) {
-                const int width = std::max(0, static_cast<int>(LOWORD(lParam)) -
-                                             kTransferStatusLeft - kTransferBarPadding);
-                MoveWindow(app.viewerTransferStatus, kTransferStatusLeft, 0, width, kTransferBarHeight, TRUE);
+                const int left = theme::Px(kTransferStatusLeft);
+                const int width = std::max(0, static_cast<int>(LOWORD(lParam)) - left - theme::Px(kTransferBarPadding));
+                MoveWindow(app.viewerTransferStatus, left, 0, width, theme::Px(kTransferBarHeight), TRUE);
             }
             InvalidateRect(window, nullptr, FALSE);
             return 0;
@@ -590,17 +698,41 @@ LRESULT CALLBACK ViewerProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     return DefWindowProcA(window, message, wParam, lParam);
 }
 
+void SetChangedText(HWND window, std::string& previous, std::string text) {
+    if (text == previous) return;
+    SetWindowTextA(window, text.c_str());
+    previous = std::move(text);
+}
+
 void UpdateUi() {
-    SetWindowTextA(app.hostText, app.hostStatus.Get().c_str());
+    const auto host = app.hostStatus.Get();
+    if (host != app.hostTextValue) {
+        SetChangedText(app.hostText, app.hostTextValue, host);
+        const auto indicator = theme::Box(47, 187, 63, 207);
+        InvalidateRect(app.main, &indicator, FALSE);
+    }
+    if (app.ipBadge) {
+        char label[40]{};
+        GetWindowTextA(app.ipBadge, label, sizeof(label));
+        const std::string_view address(label);
+        if (address.substr(0, 6) == "IPv4  ") {
+            SetChangedText(app.localIpText, app.localIpValue, std::string(address.substr(6)));
+        } else if (!address.empty()) {
+            SetChangedText(app.localIpText, app.localIpValue, "Unavailable");
+        }
+    }
 
     const bool running = app.clientRunning.load();
-    SetWindowTextA(app.connectButton, running ? "Disconnect" : "Connect");
-    EnableWindow(app.address, !running);
+    if (running != app.disconnectLabel) {
+        SetWindowTextA(app.connectButton, running ? "Disconnect" : "Connect");
+        EnableWindow(app.address, !running);
+        app.disconnectLabel = running;
+    }
     if (!app.session) return;
     const auto action = app.session->systemActionStatus.Get();
     auto connection = app.session->status.Get();
     if (!action.empty()) connection += " | " + action;
-    SetWindowTextA(app.clientText, connection.c_str());
+    SetChangedText(app.clientText, app.clientTextValue, std::move(connection));
     if (!running || !app.session->connected.load() || app.session->stop.load()) {
         if (app.viewer) DestroyWindow(app.viewer);
         return;
@@ -647,7 +779,7 @@ void ToggleClient() {
     auto target = Address(kControlPort);
     if (inet_pton(AF_INET, ip, &target.sin_addr) != 1) {
         if (app.session) app.session->status.Set("Enter a valid IPv4 address.");
-        SetWindowTextA(app.clientText, "Enter a valid IPv4 address.");
+        SetChangedText(app.clientText, app.clientTextValue, "Enter a valid IPv4 address.");
         return;
     }
 
@@ -660,15 +792,65 @@ void ToggleClient() {
 }
 
 HWND Control(const char* klass, const char* label, DWORD style, int x, int y, int width, int height,
-             int id = 0, DWORD extended = 0) {
-    HWND control = CreateWindowExA(extended, klass, label, WS_CHILD | WS_VISIBLE | style,
-                                   x, y, width, height, app.main,
+             int id = 0) {
+    HWND control = CreateWindowExA(0, klass, label, WS_CHILD | WS_VISIBLE | style,
+                                   theme::Px(x), theme::Px(y), theme::Px(width), theme::Px(height), app.main,
                                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), app.instance, nullptr);
-    SendMessageA(control, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+    SendMessageA(control, WM_SETFONT, reinterpret_cast<WPARAM>(theme::Type().body), TRUE);
     return control;
 }
 
+void PaintMain(HWND window) {
+    PAINTSTRUCT paint{};
+    const auto windowDc = BeginPaint(window, &paint);
+    RECT client{};
+    GetClientRect(window, &client);
+    HDC bufferedDc = nullptr;
+    const auto buffer = BeginBufferedPaint(windowDc, &client, BPBF_COMPATIBLEBITMAP, nullptr, &bufferedDc);
+    const auto dc = buffer ? bufferedDc : windowDc;
+    const auto& fonts = theme::Type();
+    constexpr auto line = DT_LEFT | DT_VCENTER | DT_SINGLELINE;
+
+    theme::Fill(dc, client, theme::canvas);
+    theme::Fill(dc, theme::Box(0, 0, kMainWidth, 112), theme::navy);
+    theme::Fill(dc, theme::Box(0, 109, kMainWidth, 112), RGB(51, 178, 167));
+    theme::Rounded(dc, theme::Box(24, 26, 84, 86), theme::mint, theme::mint, 14);
+    DrawIconEx(dc, theme::Px(33), theme::Px(35), LoadAppIcon(theme::Px(42), theme::Px(42)),
+               theme::Px(42), theme::Px(42), 0, nullptr, DI_NORMAL);
+    theme::Text(dc, "Phahol Remote", theme::Box(101, 24, 480, 65), fonts.title, theme::surface, line);
+    theme::Text(dc, "LAN remote desktop", theme::Box(103, 65, 470, 86), fonts.body, RGB(184, 210, 224), line);
+
+    theme::Rounded(dc, theme::Box(516, 25, 704, 87), kLocalIpBackground, kLocalIpBackground, 11);
+    theme::Text(dc, "This device IPv4", theme::Box(530, 31, 691, 55), fonts.body, RGB(184, 210, 224), line);
+
+    theme::Rounded(dc, theme::Box(24, 132, 704, 230), theme::surface, theme::border, 14);
+    theme::Text(dc, "Host", theme::Box(47, 148, 681, 181), fonts.heading, theme::text, line);
+    const std::string_view host = app.hostTextValue;
+    const bool healthy = host.substr(0, 10) == "Listening " || host.substr(0, 8) == "Sharing ";
+    const auto indicator = healthy ? theme::teal : RGB(146, 93, 14);
+    theme::Rounded(dc, theme::Box(48, 192, 58, 202), indicator, indicator, 5);
+
+    theme::Rounded(dc, theme::Box(24, 248, 704, 398), theme::surface, theme::border, 14);
+    theme::Text(dc, "Connect to a Host", theme::Box(47, 260, 681, 291), fonts.heading, theme::text, line);
+    theme::Rounded(dc, theme::Box(47, 314, 510, 357), theme::surface,
+                   GetFocus() == app.address ? theme::teal : theme::border, 8);
+    theme::Text(dc, "v" PHAHOL_REMOTE_VERSION, theme::Box(24, 405, 280, 443), fonts.label, theme::muted, line);
+
+    if (buffer) EndBufferedPaint(buffer, TRUE);
+    EndPaint(window, &paint);
+}
+
 LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    if (message != 0 && message == app.applyUpdateMessage) {
+        if (app.closing || !app.updateToken || wParam != app.updateToken) return 0;
+        std::unique_lock<std::mutex> host(app.hostSessionGate, std::try_to_lock);
+        if (!host || app.clientRunning.load()) {
+            app.deferInstall = true;
+            return 2;
+        }
+        SendMessageA(window, WM_CLOSE, 0, 0);
+        return 1;
+    }
     if (message == app.taskbarCreated && app.taskbarCreated != 0) {
         AddTrayIcon(window);
         if (app.trayAdded && IsIconic(window)) ShowWindow(window, SW_HIDE);
@@ -679,19 +861,46 @@ LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
         case WM_CREATE:
             app.main = window;
             app.hostStatus.Set("Starting LAN host...");
-            app.hostText = Control("STATIC", "Starting LAN host...", SS_LEFT, 16, 16, 575, 36);
-            Control("STATIC", "Target IPv4", SS_LEFT, 16, 65, 85, 25);
-            app.address = Control("EDIT", "", WS_TABSTOP | ES_AUTOHSCROLL, 106, 59, 181, 26, 105, WS_EX_CLIENTEDGE);
+            app.hostText = Control("STATIC", "Starting LAN host...", SS_LEFT | SS_NOPREFIX, 69, 187, 609, 32);
+            app.localIpValue = PreferredLocalIpv4();
+            if (app.localIpValue.empty()) app.localIpValue = "Unavailable";
+            app.localIpText = Control("STATIC", app.localIpValue.c_str(), SS_LEFT, 530, 57, 161, 22, kLocalIpLabel);
+            SendMessageA(app.localIpText, WM_SETFONT, reinterpret_cast<WPARAM>(theme::Type().label), TRUE);
+            Control("STATIC", "Target IPv4 address", SS_LEFT, 47, 293, 460, 19);
+            app.address = Control("EDIT", "", WS_TABSTOP | ES_AUTOHSCROLL, 59, 326, 438, 23, 105);
             SendMessageA(app.address, EM_SETLIMITTEXT, 15, 0);
-            app.connectButton = Control("BUTTON", "Connect", WS_TABSTOP, 300, 56, 115, 30, kConnectButton);
-            app.clientText = Control("STATIC", "Enter the host's LAN IPv4 address.", SS_LEFT, 16, 100, 575, 34);
+            app.connectButton = Control("BUTTON", "Connect", WS_TABSTOP | BS_OWNERDRAW, 523, 314, 158, 43, kConnectButton);
+            Control("BUTTON", "Check for updates", WS_TABSTOP | BS_OWNERDRAW, 528, 405, 176, 38, kUpdateButton);
+            app.clientText = Control("STATIC", "Enter the host's LAN IPv4 address.", SS_LEFT | SS_NOPREFIX, 47, 362, 634, 34);
+            app.updateText = Control("STATIC", "", SS_LEFT | SS_NOPREFIX | SS_CENTERIMAGE, 99, 405, 416, 38);
             SetTimer(window, 1, 33, nullptr);
             app.hostRunning.store(true);
             app.hostThread = std::thread([] {
-                RunHost(app.hostStop, app.hostStatus);
+                RunHost(app.hostStop, app.hostStatus, app.hostSessionGate);
                 app.hostRunning.store(false);
             });
             return 0;
+        case WM_PAINT:
+            PaintMain(window);
+            return 0;
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_DRAWITEM:
+            if (theme::Button(*reinterpret_cast<const DRAWITEMSTRUCT*>(lParam), wParam == kConnectButton,
+                              wParam == kConnectButton ? theme::surface : theme::canvas)) return TRUE;
+            break;
+        case WM_CTLCOLOREDIT:
+        case WM_CTLCOLORSTATIC: {
+            const auto dc = reinterpret_cast<HDC>(wParam);
+            const bool localIp = reinterpret_cast<HWND>(lParam) == app.localIpText;
+            const bool address = reinterpret_cast<HWND>(lParam) == app.address;
+            const auto background = localIp ? kLocalIpBackground :
+                reinterpret_cast<HWND>(lParam) == app.updateText ? theme::canvas : theme::surface;
+            SetBkColor(dc, background);
+            SetTextColor(dc, localIp ? theme::surface : address ? theme::text : theme::muted);
+            SetDCBrushColor(dc, background);
+            return reinterpret_cast<LRESULT>(GetStockObject(DC_BRUSH));
+        }
         case WM_SYSCOMMAND:
             if ((wParam & 0xfff0) == SC_MINIMIZE && app.trayAdded) {
                 ShowWindow(window, SW_HIDE);
@@ -714,10 +923,19 @@ LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
                 if (!app.hostRunning.load() && !app.clientRunning.load()) DestroyWindow(window);
             } else {
                 UpdateUi();
+                PollUpdate(window);
             }
             return 0;
         case WM_COMMAND:
-            if (!app.closing && HIWORD(wParam) == BN_CLICKED && LOWORD(wParam) == kConnectButton) ToggleClient();
+            if (reinterpret_cast<HWND>(lParam) == app.address &&
+                (HIWORD(wParam) == EN_SETFOCUS || HIWORD(wParam) == EN_KILLFOCUS)) {
+                const auto input = theme::Box(47, 314, 510, 357);
+                InvalidateRect(window, &input, FALSE);
+            }
+            if (!app.closing && HIWORD(wParam) == BN_CLICKED) {
+                if (LOWORD(wParam) == kConnectButton) ToggleClient();
+                if (LOWORD(wParam) == kUpdateButton) CheckForUpdates(true);
+            }
             return 0;
         case WM_CLOSE:
             if (!app.closing) {
@@ -761,12 +979,15 @@ bool RegisterWindow(const char* name, WNDPROC proc, HBRUSH background) {
 int RunUi(HINSTANCE instance, int show, bool startInTray) {
     app.instance = instance;
     app.taskbarCreated = RegisterWindowMessageA("TaskbarCreated");
-    if (!RegisterWindow(kMainClass, MainProc, GetSysColorBrush(COLOR_BTNFACE)) ||
+    app.applyUpdateMessage = RegisterWindowMessageW(kApplyUpdateMessage);
+    if (!RegisterWindow(kMainClass, MainProc, nullptr) ||
         !RegisterWindow(kViewerClass, ViewerProc, nullptr)) return 1;
 
-    HWND window = CreateWindowExA(0, kMainClass, kAppTitle,
-                                  WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                                  CW_USEDEFAULT, CW_USEDEFAULT, 625, 185,
+    constexpr DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
+    auto bounds = theme::Box(0, 0, kMainWidth, kMainHeight);
+    AdjustWindowRectEx(&bounds, style, FALSE, 0);
+    HWND window = CreateWindowExA(0, kMainClass, kAppTitle, style,
+                                  CW_USEDEFAULT, CW_USEDEFAULT, bounds.right - bounds.left, bounds.bottom - bounds.top,
                                   nullptr, nullptr, instance, nullptr);
     if (!window) return 1;
     AddTrayIcon(window);
@@ -792,7 +1013,9 @@ int RunUi(HINSTANCE instance, int show, bool startInTray) {
 } // namespace
 
 int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR arguments, int show) {
-    const bool startInTray = std::string_view(arguments) == "--tray";
+    const std::string_view args(arguments);
+    const bool retryLater = args == "--tray --defer-update";
+    const bool startInTray = args == "--tray" || retryLater;
     const std::unique_ptr<void, decltype(&CloseHandle)> mutex(
         CreateMutexA(nullptr, FALSE, "Local\\PhaholRemote"), &CloseHandle);
     const auto mutexError = GetLastError();
@@ -821,6 +1044,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR arguments, int show) {
     }
     const bool bufferedPaintReady = SUCCEEDED(BufferedPaintInit());
     const bool oleReady = SUCCEEDED(OleInitialize(nullptr));
+    if (retryLater) app.nextUpdateCheck = Clock::now() + std::chrono::hours(24);
     const int result = RunUi(instance, show, startInTray);
     if (oleReady) OleUninitialize();
     if (bufferedPaintReady) BufferedPaintUnInit();

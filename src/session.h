@@ -146,7 +146,7 @@ inline void HostSession(SOCKET tcp, sockaddr_in peer, const std::atomic_bool& st
     if (streamFailed.load()) status.Set("Screen capture failed.");
 }
 
-inline void RunHost(const std::atomic_bool& stop, Status& status) {
+inline void RunHost(const std::atomic_bool& stop, Status& status, std::mutex& sessionGate) {
     const bool allowPower = RemotePowerEnabled();
     const auto trustedSubnets = LoadTrustedSubnets();
     const std::vector<Ipv4Subnet> localOnly;
@@ -176,6 +176,8 @@ inline void RunHost(const std::atomic_bool& stop, Status& status) {
         int length = sizeof(peer);
         Socket connection(accept(listener.Get(), reinterpret_cast<sockaddr*>(&peer), &length));
         if (connection && released) {
+            std::lock_guard<std::mutex> lock(sessionGate);
+            if (stop.load()) break;
             HostSession(connection.Get(), peer, stop, status,
                         trustedSubnets ? *trustedSubnets : localOnly, input, allowPower);
         }

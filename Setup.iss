@@ -11,7 +11,7 @@ PrivilegesRequired=admin
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
-AppMutex=Local\PhaholRemote
+AppMutex={code:ApplicationMutex}
 OutputDir=build
 OutputBaseFilename=PhaholRemote-Setup
 SetupIconFile=assets\phahol-remote.ico
@@ -34,8 +34,8 @@ Filename: "{app}\PhaholRemote.exe"; Description: "Open Phahol Remote"; Flags: po
 Name: "remotepower"; Description: "Allow connected Viewers to shut down or restart this Host"; Flags: unchecked
 
 [Registry]
-Root: HKLM64; Subkey: "SOFTWARE\Phahol Remote"; ValueType: dword; ValueName: "AllowRemotePower"; ValueData: "1"; Tasks: remotepower; Flags: uninsdeletevalue
-Root: HKLM64; Subkey: "SOFTWARE\Phahol Remote"; ValueType: dword; ValueName: "AllowRemotePower"; ValueData: "0"; Tasks: not remotepower; Flags: uninsdeletevalue
+Root: HKLM64; Subkey: "SOFTWARE\Phahol Remote"; ValueType: dword; ValueName: "AllowRemotePower"; ValueData: "1"; Tasks: remotepower; Flags: uninsdeletevalue; Check: ConfigureHost
+Root: HKLM64; Subkey: "SOFTWARE\Phahol Remote"; ValueType: dword; ValueName: "AllowRemotePower"; ValueData: "0"; Tasks: not remotepower; Flags: uninsdeletevalue; Check: ConfigureHost
 
 [UninstallDelete]
 Type: files; Name: "{app}\trusted-subnets.txt"
@@ -51,10 +51,96 @@ const
   UdpProtocol = 17;
   DefaultSubnets = '192.168.0.0/16,172.16.0.0/16';
   PreviousDefaultSubnets = '192.168.34.0/24,192.168.0.0/24,172.16.0.0/16';
+  UninstallKey = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{46B59A5B-4975-459C-852F-E142DD2D5A25}_is1';
 
 var
   SubnetPage: TInputQueryWizardPage;
   TrustedSubnets: String;
+  AutoAppClosed: Boolean;
+  AutoInstallSucceeded: Boolean;
+
+function GetWindowThreadProcessId(Window: HWND; var ProcessId: DWORD): DWORD;
+  external 'GetWindowThreadProcessId@user32.dll stdcall';
+function SendMessageTimeout(Window: HWND; Msg: UINT; Cookie: WPARAM; Data: LPARAM;
+  Flags, Timeout: UINT; var Reply: DWORD_PTR): LRESULT;
+  external 'SendMessageTimeoutW@user32.dll stdcall';
+function OpenProcess(Access: DWORD; InheritHandle: BOOL; ProcessId: DWORD): HANDLE;
+  external 'OpenProcess@kernel32.dll stdcall';
+function WaitForSingleObject(Handle: HANDLE; Timeout: DWORD): DWORD;
+  external 'WaitForSingleObject@kernel32.dll stdcall';
+function CloseHandle(Handle: HANDLE): BOOL;
+  external 'CloseHandle@kernel32.dll stdcall';
+
+function ConfigureHost: Boolean;
+begin
+  Result := IsUninstaller or (ExpandConstant('{param:PHAHOLUPDATE|}') <> '1');
+end;
+
+function ApplicationMutex(Param: String): String;
+begin
+  if ConfigureHost then
+    Result := 'Local\PhaholRemote'
+  else
+    Result := '';
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  Installed: String;
+  WindowValue, Token: Int64;
+  Window: HWND;
+  ProcessId: DWORD;
+  Process: HANDLE;
+  Reply: DWORD_PTR;
+begin
+  Result := '';
+  if ConfigureHost or AutoAppClosed then
+    Exit;
+  Result := 'The automatic update needs the existing Phahol Remote installation.';
+  if not WizardSilent or
+     not RegQueryStringValue(HKLM64, UninstallKey, 'InstallLocation', Installed) or
+     (CompareText(RemoveBackslashUnlessRoot(Installed), RemoveBackslashUnlessRoot(WizardDirValue)) <> 0) or
+     not FileExists(ExpandConstant('{app}\PhaholRemote.exe')) then
+    Exit;
+
+  Result := 'Phahol Remote is busy or could not prepare for the update. Try again later.';
+  WindowValue := StrToInt64Def(ExpandConstant('{param:PHUPWINDOW|}'), 0);
+  Token := StrToInt64Def(ExpandConstant('{param:PHUPTOKEN|}'), 0);
+  if (WindowValue <= 0) or (WindowValue > 4294967295) or (Token <= 0) or (Token > 2147483647) then
+    Exit;
+  Window := HWND(WindowValue);
+  if GetWindowThreadProcessId(Window, ProcessId) = 0 then
+    Exit;
+  Process := OpenProcess($00100000, False, ProcessId);
+  if Process = 0 then
+    Exit;
+  try
+    if (SendMessageTimeout(Window, RegisterWindowMessage('PhaholRemote.ApplyVerifiedUpdate.v1'),
+      WPARAM(Token), 0, $0003, 5000, Reply) = 0) or (Reply <> 1) then
+      Exit;
+    if WaitForSingleObject(Process, 15000) <> 0 then
+      Exit;
+    AutoAppClosed := True;
+    Result := '';
+  finally
+    CloseHandle(Process);
+  end;
+end;
+
+procedure DeinitializeSetup;
+var
+  Args: String;
+  ErrorCode: Integer;
+begin
+  if not AutoAppClosed then
+    Exit;
+  Args := '--tray';
+  if not AutoInstallSucceeded then
+    Args := '--tray --defer-update';
+  if not ExecAsOriginalUser(ExpandConstant('{app}\PhaholRemote.exe'), Args, ExpandConstant('{app}'),
+                            SW_SHOWNORMAL, ewNoWait, ErrorCode) then
+    Log('Could not reopen Phahol Remote. Error ' + IntToStr(ErrorCode));
+end;
 
 procedure InitializeWizard;
 var
@@ -65,6 +151,7 @@ begin
     'Enter trusted IPv4 CIDRs separated by commas. Leave blank for local subnet only.');
   SubnetPage.Add('Additional trusted IPv4 subnets:', False);
   SavedSubnets := GetPreviousData('TrustedSubnets', DefaultSubnets);
+  TrustedSubnets := SavedSubnets;
   if SavedSubnets = PreviousDefaultSubnets then
     SavedSubnets := DefaultSubnets;
   SubnetPage.Values[0] := ExpandConstant('{param:TRUSTEDSUBNETS|' + SavedSubnets + '}');
@@ -136,7 +223,7 @@ end;
 function NextButtonClick(CurPageID: Integer): Boolean;
 begin
   Result := True;
-  if (CurPageID = SubnetPage.ID) or (CurPageID = wpReady) then
+  if ConfigureHost and ((CurPageID = SubnetPage.ID) or (CurPageID = wpReady)) then
   begin
     Result := ReadTrustedSubnets(SubnetPage.Values[0], TrustedSubnets);
     if not Result then
@@ -172,7 +259,9 @@ var
   Policy, Rules: Variant;
   RemoteScope: String;
 begin
-  if CurStep <> ssPostInstall then
+  if CurStep = ssDone then
+    AutoInstallSucceeded := True;
+  if (CurStep <> ssPostInstall) or not ConfigureHost then
     Exit;
   Policy := CreateOleObject('HNetCfg.FwPolicy2');
   Rules := Policy.Rules;

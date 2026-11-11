@@ -23,7 +23,7 @@ windres -I . -i src/phahol-remote.rc -o build/phahol-remote-icon.o
 g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic \
   -DWIN32_LEAN_AND_MEAN -DNOMINMAX -D_WIN32_WINNT=0x0A00 \
   -static -mwindows src/main.cpp build/phahol-remote-icon.o -o build/PhaholRemote.exe \
-  -lws2_32 -lgdiplus -lgdi32 -lole32 -luser32 -lbcrypt -liphlpapi -luxtheme -lshell32 -luuid -ladvapi32
+  -lws2_32 -lgdiplus -lgdi32 -lole32 -luser32 -lbcrypt -liphlpapi -luxtheme -lshell32 -luuid -ladvapi32 -lwinhttp -lruntimeobject
 ```
 
 `-static` ลิงก์ runtime ของคอมไพเลอร์เข้า EXE ส่วน GDI+, Winsock, BCrypt และส่วนประกอบ Win32 มาจาก Windows
@@ -45,7 +45,7 @@ if not exist build mkdir build
 rc /nologo /i . /fo build\phahol-remote-icon.res src\phahol-remote.rc
 cl /nologo /std:c++17 /EHsc /O2 /W4 /MT /DNOMINMAX /DWIN32_LEAN_AND_MEAN /D_WIN32_WINNT=0x0A00 ^
   /Fo:build\main.obj /Fe:build\PhaholRemote.exe src\main.cpp build\phahol-remote-icon.res ^
-  /link /SUBSYSTEM:WINDOWS ws2_32.lib gdiplus.lib gdi32.lib ole32.lib user32.lib bcrypt.lib iphlpapi.lib uxtheme.lib shell32.lib uuid.lib advapi32.lib
+  /link /SUBSYSTEM:WINDOWS ws2_32.lib gdiplus.lib gdi32.lib ole32.lib user32.lib bcrypt.lib iphlpapi.lib uxtheme.lib shell32.lib uuid.lib advapi32.lib winhttp.lib runtimeobject.lib
 ```
 
 `/MT` ลิงก์ MSVC runtime เข้า EXE ใช้ `/SUBSYSTEM:WINDOWS` สำหรับ GUI แบบ Win32
@@ -64,6 +64,18 @@ ISCC.exe .\Setup.iss
 ```
 
 ไฟล์ที่ได้คือ `build/PhaholRemote-Setup.exe`
+
+## อัปเดตจาก GitHub Releases
+
+ตั้งแต่รุ่น 0.1.25 โปรแกรมตรวจ GitHub Releases เมื่อเปิดและทุก 24 ชั่วโมง กด **Check for updates** ในหน้าต่างหลักหรือเมนูข้างนาฬิกาเพื่อตรวจทันที โปรแกรมดาวน์โหลดรุ่นใหม่ผ่าน HTTPS ตรวจ SHA-256 แล้วเริ่มติดตั้งอัตโนมัติเมื่อไม่มีเซสชัน Host หรือ Viewer Windows อาจแสดง UAC เพื่ออนุมัติสิทธิ์ติดตั้ง เมื่อเสร็จแล้วโปรแกรมเปิดกลับใน system tray และใช้ subnet, Firewall และสิทธิ์สั่งปิดเครื่องตามการตั้งค่าเดิม ให้ติดตั้งรุ่น 0.1.25 ก่อนเพื่อใช้การติดตั้งอัตโนมัติในรุ่นถัดไป
+
+สำหรับ repo แบบ Private ให้ผู้ดูแลสร้าง fine-grained GitHub token จำกัดเฉพาะ `9onizukak/phaholremote` และให้ **Contents: Read-only** จากนั้นในบัญชี Windows ที่รันแอป เปิด **Credential Manager → Windows Credentials → Add a generic credential** ตั้งชื่อ `PhaholRemote/GitHub/9onizukak/phaholremote` ใส่ชื่อบัญชี GitHub ในช่อง User name และใส่ token ในช่อง Password ตัวตรวจอัปเดตอ่าน token จาก Windows Credential Manager และใช้กับ GitHub API เท่านั้น
+
+การเผยแพร่รุ่นใหม่สำหรับตัวอัปเดต
+
+1. เปลี่ยนรุ่นใน `src/version.h` แล้วบิลด์โปรแกรมและ Setup
+2. รัน `powershell.exe -NoProfile -File .\Prepare-UpdateRelease.ps1` หลังบิลด์และลงนามไฟล์ Setup หากมีการลงนาม
+3. สร้าง GitHub Release แบบ stable ที่ tag `v<version>` หรือ `<version>` ใน [9onizukak/phaholremote](https://github.com/9onizukak/phaholremote/releases) แนบ `PhaholRemote-Setup.exe` จากโฟลเดอร์ `build/release-v<version>` แล้วเผยแพร่เป็น Latest release ตัวตรวจอัปเดตใช้ค่า SHA-256 ที่ GitHub ระบุในข้อมูลไฟล์แนบ
 
 ## เชื่อมต่อข้าม VLAN ผ่าน L3 switch
 
